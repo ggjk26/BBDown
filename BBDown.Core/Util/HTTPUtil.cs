@@ -60,7 +60,10 @@ public static class HTTPUtil
         webRequest.Headers.Connection.Clear();
 
         // Never write authentication cookies or QR-login response URLs to debug logs.
-        LogDebug("获取网页内容: Url: {0}, Cookie: {1}", url,
+        string displayUrl = url.Contains("/passport-login/web/qrcode/", StringComparison.OrdinalIgnoreCase)
+            ? "[B站二维码登录接口]"
+            : url;
+        LogDebug("获取网页内容: Url: {0}, Cookie: {1}", displayUrl,
             string.IsNullOrWhiteSpace(requestCookie) ? "无" : "[已隐藏]");
         var webResponse = (await AppHttpClient.SendAsync(webRequest, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
 
