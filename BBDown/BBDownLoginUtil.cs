@@ -3,7 +3,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -68,35 +67,23 @@ internal static class BBDownLoginUtil
         return true;
     }
 
-    private static bool IsAllowedBilibiliRedirect(Uri uri)
-    {
-        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        string host = uri.IdnHost;
-        return host.Equals("bilibili.com", StringComparison.OrdinalIgnoreCase)
-            || host.EndsWith(".bilibili.com", StringComparison.OrdinalIgnoreCase)
-            || host.Equals("biligame.com", StringComparison.OrdinalIgnoreCase)
-            || host.EndsWith(".biligame.com", StringComparison.OrdinalIgnoreCase);
-    }
-
     private static async Task<string> ExchangeCrossDomainTicketForCookieAsync(Uri ticketUri)
     {
-        // Bilibili's 2026-08 QR-login flow returns a one-time cross-domain ticket.
-        // The browser obtains the real cookies from Set-Cookie while following this
-        // redirect chain. Do not re-poll qrcode_key after status 0: it is already spent.
-        if (!ticketUri.IdnHost.Equals("passport.biligame.com", StringComparison.OrdinalIgnoreCase)
+        // Since 2026-08 the QR poll returns a one-time crossDomain ticket.
+        // The first response from passport.biligame.com carries the actual cookies
+        // in Set-Cookie. Do not follow its Location header: it is an SSO handoff
+        // to other Bilibili-related services, not another cookie-exchange step.
+        if (!string.Equals(ticketUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            || !ticketUri.IdnHost.Equals("passport.biligame.com", StringComparison.OrdinalIgnoreCase)
             || !ticketUri.AbsolutePath.Contains("crossDomain", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException("B站返回了无法识别的跨域登录票据地址。");
+            throw new InvalidOperationException("B站返回的跨域登录票据不是可信的 passport.biligame.com HTTPS 地址。");
         }
 
-        var cookieContainer = new CookieContainer();
         using var handler = new HttpClientHandler
         {
             AllowAutoRedirect = false,
-            UseCookies = true,
-            CookieContainer = cookieContainer,
+            UseCookies = false,
             AutomaticDecompression = System.Net.DecompressionMethods.All
         };
         using var client = new HttpClient(handler)
@@ -104,59 +91,42 @@ internal static class BBDownLoginUtil
             Timeout = TimeSpan.FromSeconds(30)
         };
 
-        Uri currentUri = ticketUri;
-        Uri? previousUri = null;
-        bool completed = false;
+        using var request = new HttpRequestMessage(HttpMethod.Get, ticketUri);
+        request.Headers.TryAddWithoutValidation(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+        request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        request.Headers.TryAddWithoutValidation("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+        request.Headers.Referrer = new Uri("https://passport.bilibili.com/");
 
-        for (int redirectCount = 0; redirectCount < 10; redirectCount++)
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+        // This endpoint commonly responds with a redirect. The cookies are on this
+        // response itself, so inspect Set-Cookie before considering the Location header.
+        var collectedCookies = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (response.Headers.TryGetValues("Set-Cookie", out var setCookieHeaders))
         {
-            if (!IsAllowedBilibiliRedirect(currentUri))
-                throw new InvalidOperationException("B站跨域登录跳转到了非可信 HTTPS 域名，已停止请求。");
-
-            using var request = new HttpRequestMessage(HttpMethod.Get, currentUri);
-            request.Headers.TryAddWithoutValidation("User-Agent", HTTPUtil.UserAgent);
-            request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
-            request.Headers.TryAddWithoutValidation("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
-            request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true };
-            request.Headers.Referrer = previousUri ?? new Uri("https://passport.bilibili.com/");
-
-            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-            int statusCode = (int)response.StatusCode;
-            bool isRedirect = statusCode is 301 or 302 or 303 or 307 or 308;
-
-            if (isRedirect)
+            foreach (string rawHeader in setCookieHeaders)
             {
-                if (response.Headers.Location is null)
-                    throw new InvalidOperationException("B站跨域登录响应缺少重定向地址。");
+                // Each Set-Cookie header defines one cookie. Do not split on commas:
+                // Expires attributes themselves contain commas.
+                string pair = rawHeader.Split(';', 2)[0].Trim();
+                int separator = pair.IndexOf('=');
+                if (separator <= 0)
+                    continue;
 
-                Uri nextUri = response.Headers.Location.IsAbsoluteUri
-                    ? response.Headers.Location
-                    : new Uri(currentUri, response.Headers.Location);
-
-                if (!IsAllowedBilibiliRedirect(nextUri))
-                    throw new InvalidOperationException("B站跨域登录跳转到了非可信 HTTPS 域名，已停止请求。");
-
-                previousUri = currentUri;
-                currentUri = nextUri;
-                continue;
+                string name = pair[..separator].Trim();
+                string value = pair[(separator + 1)..].Trim();
+                if (WebCookieNames.Contains(name) && !string.IsNullOrWhiteSpace(value))
+                    collectedCookies[name] = value;
             }
-
-            response.EnsureSuccessStatusCode();
-            completed = true;
-            break;
         }
 
-        if (!completed)
-            throw new InvalidOperationException("B站跨域登录重定向次数过多，未能取得登录 Cookie。");
-
-        // Only retrieve cookies that the browser would send to the WEB navigation API.
-        // CookieContainer automatically enforces Domain/Path/Secure/expiry attributes.
-        var apiCookies = cookieContainer.GetCookies(new Uri("https://api.bilibili.com/"));
-        var collectedCookies = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (Cookie item in apiCookies)
+        if (!collectedCookies.TryGetValue("SESSDATA", out var sessData)
+            || string.IsNullOrWhiteSpace(sessData))
         {
-            if (WebCookieNames.Contains(item.Name) && !string.IsNullOrWhiteSpace(item.Value))
-                collectedCookies[item.Name] = item.Value;
+            throw new InvalidOperationException(
+                $"B站跨域票据响应未下发 SESSDATA（HTTP {(int)response.StatusCode}）。请重新扫码；没有保存任何凭据。");
         }
 
         return BuildWebCookie(collectedCookies);
