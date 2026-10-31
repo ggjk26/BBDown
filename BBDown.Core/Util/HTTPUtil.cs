@@ -34,12 +34,25 @@ public static class HTTPUtil
 
     public static string UserAgent { get; set; } = GetRandomUserAgent();
 
-    public static async Task<string> GetWebSourceAsync(string url, string? userAgent = null)
+    public static async Task<string> GetWebSourceAsync(string url, string? userAgent = null, string? cookie = null)
     {
         using var webRequest = new HttpRequestMessage(HttpMethod.Get, url);
         webRequest.Headers.TryAddWithoutValidation("User-Agent", userAgent ?? UserAgent);
         webRequest.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip, deflate");
-        webRequest.Headers.TryAddWithoutValidation("Cookie", (url.Contains("/ep") || url.Contains("/ss")) ? Config.COOKIE + ";CURRENT_FNVAL=4048;" : Config.COOKIE);
+
+        // Prefer an explicitly supplied cookie over global state. This is important for
+        // login verification, where the cookie being tested must be the one actually sent.
+        string requestCookie = cookie ?? Config.COOKIE;
+        if (url.Contains("/ep") || url.Contains("/ss"))
+        {
+            requestCookie = string.IsNullOrWhiteSpace(requestCookie)
+                ? "CURRENT_FNVAL=4048"
+                : $"{requestCookie.Trim().TrimEnd(';')}; CURRENT_FNVAL=4048";
+        }
+
+        if (!string.IsNullOrWhiteSpace(requestCookie))
+            webRequest.Headers.TryAddWithoutValidation("Cookie", requestCookie);
+
         if (url.Contains("api.bilibili.com"))
             webRequest.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com/");
         if (url.Contains("api.bilibili.tv"))
