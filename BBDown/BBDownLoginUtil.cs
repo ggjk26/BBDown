@@ -1,4 +1,4 @@
-﻿using QRCoder;
+using QRCoder;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -197,7 +197,7 @@ internal static class BBDownLoginUtil
 
                         await SaveWebCookieAsync(cookie);
                         BBDown.Core.Config.COOKIE = cookie;
-                        LogColor("登录成功：B 站账号已验证，WEB Cookie 已保存。");
+                        LogColor($"登录成功：B 站账号已验证，WEB Cookie 已保存至 {Program.USER_DATA_DIR}。");
                         loggedIn = true;
                         break;
                     }
