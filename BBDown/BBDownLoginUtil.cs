@@ -17,22 +17,32 @@ internal static class BBDownLoginUtil
 {
     private const int WebQrCodeLifetimeSeconds = 180;
 
-    private static string ExtractWebCookie(string loginUrl)
+    private static readonly HashSet<string> WebCookieNames = new(StringComparer.Ordinal)
     {
+        "DedeUserID",
+        "DedeUserID__ckMd5",
+        "SESSDATA",
+        "bili_jct"
+    };
+
+    private static string BuildWebCookie(IDictionary<string, string> cookies)
+    {
+        if (!cookies.TryGetValue("SESSDATA", out var sessData) || string.IsNullOrWhiteSpace(sessData))
+            throw new InvalidOperationException("B站登录流程没有下发 SESSDATA，无法建立 WEB 会话。");
+
+        string[] preferredOrder = ["DedeUserID", "DedeUserID__ckMd5", "SESSDATA", "bili_jct"];
+        return string.Join("; ", preferredOrder
+            .Where(cookies.ContainsKey)
+            .Select(name => $"{name}={cookies[name]}"));
+    }
+
+    private static bool TryExtractWebCookieFromUrl(string loginUrl, out string cookie)
+    {
+        cookie = string.Empty;
         if (!Uri.TryCreate(loginUrl, UriKind.Absolute, out var uri))
-            throw new InvalidOperationException("B站登录接口返回了无效的登录跳转地址。");
+            return false;
 
-        // Only persist actual authentication cookies. The SSO URL may also contain
-        // Expires/gourl query parameters, which are not browser cookies.
-        var allowedNames = new HashSet<string>(StringComparer.Ordinal)
-        {
-            "DedeUserID",
-            "DedeUserID__ckMd5",
-            "SESSDATA",
-            "bili_jct"
-        };
         var cookies = new Dictionary<string, string>(StringComparer.Ordinal);
-
         foreach (string segment in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
         {
             string pair = segment.Trim();
@@ -41,23 +51,129 @@ internal static class BBDownLoginUtil
                 continue;
 
             string name = Uri.UnescapeDataString(pair[..separator]).Trim();
-            if (!allowedNames.Contains(name))
+            if (!WebCookieNames.Contains(name))
                 continue;
 
-            // Keep the value URL-escaped. Cookie values can contain reserved characters
-            // that must not be decoded before being sent back in the Cookie header.
+            // Preserve the escaped value exactly as Bilibili supplied it.
             string value = pair[(separator + 1)..].Trim();
             if (!string.IsNullOrWhiteSpace(value))
                 cookies[name] = value;
         }
 
         if (!cookies.TryGetValue("SESSDATA", out var sessData) || string.IsNullOrWhiteSpace(sessData))
-            throw new InvalidOperationException("登录结果中没有包含 SESSDATA，无法建立 WEB 会话。");
+            return false;
 
-        string[] preferredOrder = ["DedeUserID", "DedeUserID__ckMd5", "SESSDATA", "bili_jct"];
-        return string.Join("; ", preferredOrder
-            .Where(cookies.ContainsKey)
-            .Select(name => $"{name}={cookies[name]}"));
+        cookie = BuildWebCookie(cookies);
+        return true;
+    }
+
+    private static bool IsAllowedBilibiliRedirect(Uri uri)
+    {
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string host = uri.IdnHost;
+        return host.Equals("bilibili.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".bilibili.com", StringComparison.OrdinalIgnoreCase)
+            || host.Equals("biligame.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".biligame.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<string> ExchangeCrossDomainTicketForCookieAsync(Uri ticketUri)
+    {
+        // Bilibili's 2026-08 QR-login flow returns a one-time cross-domain ticket.
+        // The browser obtains the real cookies from Set-Cookie while following this
+        // redirect chain. Do not re-poll qrcode_key after status 0: it is already spent.
+        if (!ticketUri.IdnHost.Equals("passport.biligame.com", StringComparison.OrdinalIgnoreCase)
+            || !ticketUri.AbsolutePath.Contains("crossDomain", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("B站返回了无法识别的跨域登录票据地址。");
+        }
+
+        var cookieContainer = new CookieContainer();
+        using var handler = new HttpClientHandler
+        {
+            AllowAutoRedirect = false,
+            UseCookies = true,
+            CookieContainer = cookieContainer,
+            AutomaticDecompression = System.Net.DecompressionMethods.All
+        };
+        using var client = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromSeconds(30)
+        };
+
+        Uri currentUri = ticketUri;
+        Uri? previousUri = null;
+        bool completed = false;
+
+        for (int redirectCount = 0; redirectCount < 10; redirectCount++)
+        {
+            if (!IsAllowedBilibiliRedirect(currentUri))
+                throw new InvalidOperationException("B站跨域登录跳转到了非可信 HTTPS 域名，已停止请求。");
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, currentUri);
+            request.Headers.TryAddWithoutValidation("User-Agent", HTTPUtil.UserAgent);
+            request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+            request.Headers.TryAddWithoutValidation("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+            request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true };
+            request.Headers.Referrer = previousUri ?? new Uri("https://passport.bilibili.com/");
+
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            int statusCode = (int)response.StatusCode;
+            bool isRedirect = statusCode is 301 or 302 or 303 or 307 or 308;
+
+            if (isRedirect)
+            {
+                if (response.Headers.Location is null)
+                    throw new InvalidOperationException("B站跨域登录响应缺少重定向地址。");
+
+                Uri nextUri = response.Headers.Location.IsAbsoluteUri
+                    ? response.Headers.Location
+                    : new Uri(currentUri, response.Headers.Location);
+
+                if (!IsAllowedBilibiliRedirect(nextUri))
+                    throw new InvalidOperationException("B站跨域登录跳转到了非可信 HTTPS 域名，已停止请求。");
+
+                previousUri = currentUri;
+                currentUri = nextUri;
+                continue;
+            }
+
+            response.EnsureSuccessStatusCode();
+            completed = true;
+            break;
+        }
+
+        if (!completed)
+            throw new InvalidOperationException("B站跨域登录重定向次数过多，未能取得登录 Cookie。");
+
+        // Only retrieve cookies that the browser would send to the WEB navigation API.
+        // CookieContainer automatically enforces Domain/Path/Secure/expiry attributes.
+        var apiCookies = cookieContainer.GetCookies(new Uri("https://api.bilibili.com/"));
+        var collectedCookies = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (Cookie item in apiCookies)
+        {
+            if (WebCookieNames.Contains(item.Name) && !string.IsNullOrWhiteSpace(item.Value))
+                collectedCookies[item.Name] = item.Value;
+        }
+
+        return BuildWebCookie(collectedCookies);
+    }
+
+    private static async Task<string> ExtractWebCookieAsync(string loginUrl)
+    {
+        if (!Uri.TryCreate(loginUrl, UriKind.Absolute, out var uri))
+            throw new InvalidOperationException("B站登录接口返回了无效的登录跳转地址。");
+
+        // Continue supporting the legacy format where cookies are embedded in data.url.
+        if (TryExtractWebCookieFromUrl(loginUrl, out string legacyCookie))
+            return legacyCookie;
+
+        // New format: passport.biligame.com crossDomain ticket, with cookies supplied
+        // by Set-Cookie on the redirect response chain.
+        Log("检测到新版 B 站跨域登录票据，正在安全兑换 WEB Cookie...");
+        return await ExchangeCrossDomainTicketForCookieAsync(uri);
     }
 
     private static async Task SaveWebCookieAsync(string cookie)
@@ -188,7 +304,7 @@ internal static class BBDownLoginUtil
                         if (string.IsNullOrWhiteSpace(redirectUrl))
                             throw new InvalidOperationException("B站报告扫码成功，但没有返回 Cookie 跳转地址。");
 
-                        string cookie = ExtractWebCookie(redirectUrl);
+                        string cookie = await ExtractWebCookieAsync(redirectUrl);
                         Log("正在验证登录凭据...");
                         if (!await CheckLogin(cookie))
                         {
