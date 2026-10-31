@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Http.Headers;
 using static BBDown.Core.Logger;
 
@@ -10,8 +10,7 @@ public static class HTTPUtil
     public static readonly HttpClient AppHttpClient = new(new HttpClientHandler
     {
         AllowAutoRedirect = true,
-        AutomaticDecompression = DecompressionMethods.All,
-        ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true
+        AutomaticDecompression = DecompressionMethods.All
     })
     {
         Timeout = TimeSpan.FromMinutes(2)
@@ -60,11 +59,16 @@ public static class HTTPUtil
         webRequest.Headers.CacheControl = CacheControlHeaderValue.Parse("no-cache");
         webRequest.Headers.Connection.Clear();
 
-        LogDebug("获取网页内容: Url: {0}, Headers: {1}", url, webRequest.Headers);
+        // Never write authentication cookies or QR-login response URLs to debug logs.
+        LogDebug("获取网页内容: Url: {0}, Cookie: {1}", url,
+            string.IsNullOrWhiteSpace(requestCookie) ? "无" : "[已隐藏]");
         var webResponse = (await AppHttpClient.SendAsync(webRequest, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
 
         string htmlCode = await webResponse.Content.ReadAsStringAsync();
-        LogDebug("Response: {0}", htmlCode);
+        if (string.IsNullOrWhiteSpace(requestCookie) && !url.Contains("/passport-login/web/qrcode/"))
+            LogDebug("Response: {0}", htmlCode);
+        else
+            LogDebug("已收到可能包含认证信息的响应正文（日志中已隐藏）。");
         return htmlCode;
     }
 
