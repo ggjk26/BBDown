@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Http.Headers;
 using static BBDown.Core.Logger;
 
@@ -10,8 +10,7 @@ public static class HTTPUtil
     public static readonly HttpClient AppHttpClient = new(new HttpClientHandler
     {
         AllowAutoRedirect = true,
-        AutomaticDecompression = DecompressionMethods.All,
-        ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true
+        AutomaticDecompression = DecompressionMethods.All
     })
     {
         Timeout = TimeSpan.FromMinutes(2)
@@ -34,12 +33,25 @@ public static class HTTPUtil
 
     public static string UserAgent { get; set; } = GetRandomUserAgent();
 
-    public static async Task<string> GetWebSourceAsync(string url, string? userAgent = null)
+    public static async Task<string> GetWebSourceAsync(string url, string? userAgent = null, string? cookie = null)
     {
         using var webRequest = new HttpRequestMessage(HttpMethod.Get, url);
         webRequest.Headers.TryAddWithoutValidation("User-Agent", userAgent ?? UserAgent);
         webRequest.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip, deflate");
-        webRequest.Headers.TryAddWithoutValidation("Cookie", (url.Contains("/ep") || url.Contains("/ss")) ? Config.COOKIE + ";CURRENT_FNVAL=4048;" : Config.COOKIE);
+
+        // Prefer an explicitly supplied cookie over global state. This is important for
+        // login verification, where the cookie being tested must be the one actually sent.
+        string requestCookie = cookie ?? Config.COOKIE;
+        if (url.Contains("/ep") || url.Contains("/ss"))
+        {
+            requestCookie = string.IsNullOrWhiteSpace(requestCookie)
+                ? "CURRENT_FNVAL=4048"
+                : $"{requestCookie.Trim().TrimEnd(';')}; CURRENT_FNVAL=4048";
+        }
+
+        if (!string.IsNullOrWhiteSpace(requestCookie))
+            webRequest.Headers.TryAddWithoutValidation("Cookie", requestCookie);
+
         if (url.Contains("api.bilibili.com"))
             webRequest.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com/");
         if (url.Contains("api.bilibili.tv"))
@@ -47,11 +59,19 @@ public static class HTTPUtil
         webRequest.Headers.CacheControl = CacheControlHeaderValue.Parse("no-cache");
         webRequest.Headers.Connection.Clear();
 
-        LogDebug("获取网页内容: Url: {0}, Headers: {1}", url, webRequest.Headers);
+        // Never write authentication cookies or QR-login response URLs to debug logs.
+        string displayUrl = url.Contains("/passport-login/web/qrcode/", StringComparison.OrdinalIgnoreCase)
+            ? "[B站二维码登录接口]"
+            : url;
+        LogDebug("获取网页内容: Url: {0}, Cookie: {1}", displayUrl,
+            string.IsNullOrWhiteSpace(requestCookie) ? "无" : "[已隐藏]");
         var webResponse = (await AppHttpClient.SendAsync(webRequest, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
 
         string htmlCode = await webResponse.Content.ReadAsStringAsync();
-        LogDebug("Response: {0}", htmlCode);
+        if (string.IsNullOrWhiteSpace(requestCookie) && !url.Contains("/passport-login/web/qrcode/"))
+            LogDebug("Response: {0}", htmlCode);
+        else
+            LogDebug("已收到可能包含认证信息的响应正文（日志中已隐藏）。");
         return htmlCode;
     }
 

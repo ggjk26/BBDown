@@ -30,6 +30,22 @@ partial class Program
 
     public static readonly string APP_DIR = Path.GetDirectoryName(Environment.ProcessPath)!;
 
+    // Store credentials in a user-writable location rather than beside the executable
+    // (which may be under Program Files or a shared dotnet installation).
+    private static string ResolveUserDataDirectory()
+    {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrWhiteSpace(localAppData))
+            return Path.Combine(localAppData, "BBDown");
+
+        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return string.IsNullOrWhiteSpace(userProfile)
+            ? APP_DIR
+            : Path.Combine(userProfile, ".bbdown");
+    }
+
+    public static readonly string USER_DATA_DIR = ResolveUserDataDirectory();
+
     private static string FormatTimeStamp(long ts, string format)
     {
         try

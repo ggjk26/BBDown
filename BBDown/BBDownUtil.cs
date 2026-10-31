@@ -589,19 +589,66 @@ static partial class BBDownUtil
 
     public static async Task<bool> CheckLogin(string cookie)
     {
+        if (string.IsNullOrWhiteSpace(cookie))
+        {
+            LogDebug("未提供 WEB Cookie，跳过登录验证。");
+            return false;
+        }
+
         try
         {
-            var api = "https://api.bilibili.com/x/web-interface/nav";
-            var source = await GetWebSourceAsync(api);
-            var json = JsonDocument.Parse(source).RootElement;
-            var is_login = json.GetProperty("data").GetProperty("isLogin").GetBoolean();
-            var wbi_img = json.GetProperty("data").GetProperty("wbi_img");
-            Core.Config.WBI = GetMixinKey(RSubString(wbi_img.GetProperty("img_url").GetString()) + RSubString(wbi_img.GetProperty("sub_url").GetString()));
-            LogDebug("wbi: {0}", Core.Config.WBI);
-            return is_login;
+            const string api = "https://api.bilibili.com/x/web-interface/nav";
+            // Verify the exact cookie supplied by the caller instead of relying on mutable global state.
+            var source = await GetWebSourceAsync(api, cookie: cookie);
+            using var document = JsonDocument.Parse(source);
+            var root = document.RootElement;
+
+            if (!root.TryGetProperty("code", out var responseCode)
+                || responseCode.ValueKind != JsonValueKind.Number
+                || responseCode.GetInt32() != 0
+                || !root.TryGetProperty("data", out var data)
+                || !data.TryGetProperty("isLogin", out var isLoginElement)
+                || isLoginElement.ValueKind != JsonValueKind.True)
+            {
+                string message = root.TryGetProperty("message", out var messageElement)
+                    ? messageElement.GetString() ?? "未知原因"
+                    : "导航接口未返回有效登录状态";
+                LogDebug("B站登录验证未通过：{0}", message);
+                return false;
+            }
+
+            // WBI metadata is useful for signing later requests, but it is not part of
+            // authentication. Missing or malformed WBI fields must not turn a valid
+            // account session into a false "not logged in" result.
+            try
+            {
+                if (data.TryGetProperty("wbi_img", out var wbiImage)
+                    && wbiImage.TryGetProperty("img_url", out var imgElement)
+                    && wbiImage.TryGetProperty("sub_url", out var subElement))
+                {
+                    string? imgUrl = imgElement.GetString();
+                    string? subUrl = subElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(imgUrl) && !string.IsNullOrWhiteSpace(subUrl))
+                    {
+                        Core.Config.WBI = GetMixinKey(RSubString(imgUrl) + RSubString(subUrl));
+                        LogDebug("wbi: {0}", Core.Config.WBI);
+                    }
+                }
+                else
+                {
+                    LogDebug("B站导航接口未提供 WBI 元数据；登录状态仍然有效。");
+                }
+            }
+            catch (Exception wbiException)
+            {
+                LogDebug("初始化 WBI 元数据失败，但不影响登录状态：{0}", wbiException.Message);
+            }
+
+            return true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            LogDebug("B站登录状态检查失败：{0}", ex.Message);
             return false;
         }
     }
