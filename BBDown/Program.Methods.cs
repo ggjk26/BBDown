@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
@@ -242,12 +242,32 @@ internal partial class Program
     /// <param name="myOption"></param>
     private static void LoadCredentials(MyOption myOption)
     {
-        if (string.IsNullOrEmpty(Config.COOKIE) && File.Exists(Path.Combine(APP_DIR, "BBDown.data")))
+        if (string.IsNullOrEmpty(Config.COOKIE))
         {
-            Log("加载本地cookie...");
-            LogDebug("文件路径：{0}", Path.Combine(APP_DIR, "BBDown.data"));
-            Config.COOKIE = File.ReadAllText(Path.Combine(APP_DIR, "BBDown.data"));
+            // Prefer the new per-user location. Keep the executable-directory path as
+            // a fallback so existing installations continue to work without migration.
+            string[] cookiePaths =
+            [
+                Path.Combine(USER_DATA_DIR, "BBDown.data"),
+                Path.Combine(APP_DIR, "BBDown.data")
+            ];
+
+            foreach (string cookiePath in cookiePaths)
+            {
+                if (!File.Exists(cookiePath))
+                    continue;
+
+                string savedCookie = File.ReadAllText(cookiePath).Trim();
+                if (string.IsNullOrWhiteSpace(savedCookie))
+                    continue;
+
+                Log("加载本地 WEB Cookie...");
+                LogDebug("文件路径：{0}", cookiePath);
+                Config.COOKIE = savedCookie;
+                break;
+            }
         }
+
         if (string.IsNullOrEmpty(Config.TOKEN) && File.Exists(Path.Combine(APP_DIR, "BBDownTV.data")) && myOption.UseTvApi)
         {
             Log("加载本地token...");
